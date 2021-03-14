@@ -1,0 +1,10 @@
+*.pyc
+@AutomationLog.txt
+__pycache__
+*.egginfo
+source
+build
+dist
+*.egg-info
+src
+.idea
