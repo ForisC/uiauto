@@ -1,4 +1,3 @@
-from distutils.text_file import TextFile
 from setuptools import find_packages, setup
 from uiauto import VERSION
 
