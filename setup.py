@@ -22,5 +22,5 @@ setup(
         "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
     ],
-    install_requires=TextFile("requirements.txt").readlines(),
+    install_requires=["uiautomation==2.0.10"],
 )
