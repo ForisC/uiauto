@@ -1,25 +1,119 @@
+import collections
+from ctypes import DEFAULT_MODE
+import logging
+import os
 from datetime import datetime
-from uiautomation import *
+from pathlib import Path
+
+import comtypes
+import uiautomation
+from uiautomation import *  # pylint: disable=unused-wildcard-import
 from uiautomation.uiautomation import _AutomationClient
 
+from .controls import *  # pylint: disable=unused-wildcard-import
+from .errors import ApplicationError, PatternError, UiLookupError
+from .utils import draw_rectangle, embedded_image, toggle_state
 
-def autoRefind(fn):
-    def wrapper(self, *args, **kwargs):
-        self.Refind()
-        return fn(self, *args, **kwargs)
-    return wrapper
+comtypes.logger.disabled = True
 
-
-def autoRefindProperty(fn):
-    fn = fn.fget
-
-    def wrapper(self, *args, **kwargs):
-        self.Refind()
-        return fn(self, *args, **kwargs)
-    return property(wrapper)
+ENABLE_SCREENSHOT = True
+DEBUG_MODE = False
+DEFAULT_LOG_PATH = Path(os.getcwd()) / "LOGS"
 
 
-def WalkControl(control: Control, includeTop: bool = False, maxDepth: int = 0xFFFFFFFF, autoRefind=True):
+def SetLogDir(value):
+    global LOG_DIR
+    LOG_DIR = Path(value)
+    if not LOG_DIR.is_dir():
+        LOG_DIR.mkdir(parents=True)
+    uiautomation.Logger.SetLogFile(str(LOG_DIR / "@AutomationLog.txt"))
+
+
+SetLogDir(DEFAULT_LOG_PATH)
+
+
+def EnableDebugMode(value):
+    global DEBUG_MODE
+    DEBUG_MODE = value
+
+
+def EnableScreenshot(value):
+    global ENABLE_SCREENSHOT
+    ENABLE_SCREENSHOT = value
+
+
+def Screenshot(self=uiautomation.GetRootControl(), filename=f"{time.strftime(r'%Y%m%d-%H%M%S')}.jpg", log=True):
+    if not ENABLE_SCREENSHOT:
+        return "Screenshot disabled"
+    file_path = LOG_DIR / filename
+    stem = file_path.stem
+    suffix = file_path.suffix
+
+    num = 1
+    while file_path.is_file():
+        file_path = LOG_DIR / f"{stem}-{num}{suffix}"
+        num += 1
+
+    rect = self.Element.CurrentBoundingRectangle
+    x = rect.left
+    y = rect.top
+    w = rect.right - rect.left
+    h = rect.bottom - rect.top
+
+    self.CaptureToImage(str(file_path), x, y, w, h)
+    logging.debug(f"Screenshot to file: {file_path}")
+    try:
+        relative_path = file_path.relative_to(os.getcwd())
+    except ValueError:
+        relative_path = file_path
+
+    if log:
+        if "robot" in sys.modules:
+            from robot.api import logger
+            logger.info(f"Screenshot to file {file_path}\n"
+                        f"{embedded_image(relative_path)}", html=True)
+        else:
+            logging.info(f"Screenshot to file {file_path}")
+
+    return relative_path
+
+
+def patched_Refind(self, maxSearchSeconds: float = TIME_OUT_SECOND, searchIntervalSeconds: float = SEARCH_INTERVAL, raiseException: bool = True) -> bool:
+    """
+    Refind the control every searchIntervalSeconds seconds in maxSearchSeconds seconds.
+    maxSearchSeconds: float.
+    searchIntervalSeconds: float.
+    raiseException: bool, if True, raise a LookupError if timeout.
+    Return bool, True if find.
+    """
+    if not self.Exists(maxSearchSeconds, searchIntervalSeconds, False if raiseException else DEBUG_EXIST_DISAPPEAR):
+        if raiseException:
+            Logger.ColorfullyLog('<Color=Red>Find Control Timeout: </Color>' + self.GetColorfulSearchPropertiesStr())
+            raise UiLookupError('Find Control Timeout: ' + self.GetSearchPropertiesStr())
+        else:
+            return False
+    return True
+
+
+def patched_Element(self):
+    """
+    Property Element.
+    Return `ctypes.POINTER(IUIAutomationElement)`.
+    """
+    if not self._element:
+        self.Refind(maxSearchSeconds=TIME_OUT_SECOND, searchIntervalSeconds=self.searchInterval)
+
+    try:
+        _AutomationClient.instance().ViewWalker.GetFirstChildElement(self._element)
+    except comtypes.COMError:
+        logging.info(f"{self.GetSearchPropertiesStr()} fail to access instance, try to refind")
+        self._element = 0
+        self.Refind(maxSearchSeconds=TIME_OUT_SECOND, searchIntervalSeconds=self.searchInterval, raiseException=False)
+
+    return self._element
+
+
+def patched_WalkControl(control: Control, includeTop: bool = False, maxDepth: int = 0xFFFFFFFF):
     """
     control: `Control` or its subclass.
     includeTop: bool, if True, yield (control, 0) first.
@@ -30,55 +124,215 @@ def WalkControl(control: Control, includeTop: bool = False, maxDepth: int = 0xFF
         yield control, 0
     if maxDepth <= 0:
         return
-    depth = 0
 
-    control.searchByWalk = True
-    child = control.GetFirstChildControl(autoRefind=autoRefind)
-    controlList = [child]
-    while depth >= 0:
-        lastControl = controlList[-1]
-        if lastControl:
-            yield lastControl, depth + 1
-            child = lastControl.GetNextSiblingControl(autoRefind=autoRefind)
-            controlList[depth] = child
-            if depth + 1 < maxDepth:
+    if not control.isPidControl:
+        depth = 0
+        control.searchByWalk = True
+        child = control.GetFirstChildControl()
+        controlList = [child]
+        while depth >= 0:
+            lastControl = controlList[-1]
+            if lastControl:
+                yield lastControl, depth + 1
                 lastControl.searchByWalk = True
-                child = lastControl.GetFirstChildControl(autoRefind=autoRefind)
-                if child:
-                    depth += 1
-                    controlList.append(child)
-        else:
-            del controlList[depth]
-            depth -= 1
+                child = lastControl.GetNextSiblingControl()
+                controlList[depth] = child
+                if depth + 1 < maxDepth:
+                    lastControl.searchByWalk = True
+                    child = lastControl.GetFirstChildControl()
+                    if child:
+                        depth += 1
+                        controlList.append(child)
+            else:
+                del controlList[depth]
+                depth -= 1
+
+    else:
+        for sub_control in control.Controls:
+            depth = 0
+            yield sub_control, 0
+            sub_control.searchByWalk = True
+            child = sub_control.GetFirstChildControl()
+            controlList = [child]
+            while depth >= 0:
+                lastControl = controlList[-1]
+                if lastControl:
+                    yield lastControl, depth + 1
+                    lastControl.searchByWalk = True
+                    child = lastControl.GetNextSiblingControl()
+                    controlList[depth] = child
+                    if depth + 1 < maxDepth:
+                        lastControl.searchByWalk = True
+                        child = lastControl.GetFirstChildControl()
+                        if child:
+                            depth += 1
+                            controlList.append(child)
+                else:
+                    del controlList[depth]
+                    depth -= 1
 
 
-def FindControl(control: Control, compare: Callable[[Control, int], bool], maxDepth: int = 0xFFFFFFFF, findFromSelf: bool = False, foundIndex: int = 1, autoRefind=True) -> Control:
+def patched_CompareFunction(self, control: 'Control', depth: int) -> bool:
     """
+    Define how to search.
     control: `Control` or its subclass.
-    compare: Callable[[Control, int], bool], function(control: Control, depth: int) -> bool.
-    maxDepth: int, enum depth.
-    findFromSelf: bool, if False, do not compare self.
-    foundIndex: int, starts with 1, >= 1.
-    Return `Control` subclass or None if not find.
+    depth: int, tree depth from searchFromControl.
+    Return bool.
     """
-    foundCount = 0
 
-    if not control:
-        control = GetRootControl()
-    elif autoRefind:
-        control.Refind()
-    traverseCount = 0
+    for key, value in self.searchProperties.items():
+        if 'ControlType' == key:
+            if value != control.ControlType:
+                return False
+        elif 'ClassName' == key:
+            if value != control.ClassName:
+                return False
+        elif 'AutomationId' == key:
+            if value != control.AutomationId:
+                return False
+        elif 'Depth' == key:
+            if value != depth:
+                return False
+        elif 'Name' == key:
+            if value != control.Name:
+                return False
+        elif 'SubName' == key:
+            if value not in control.Name:
+                return False
+        elif 'RegexName' == key:
+            if not self.regexName.match(control.Name):
+                return False
+        elif 'Compare' == key:
+            if not value(control, depth):
+                return False
+        elif 'Child' == key:
+            child_control = FindControl(control, value._CompareFunction, value.searchDepth, False, value.foundIndex)
+            if not child_control:
+                return False
+    return True
 
-    for child, depth in WalkControl(control, findFromSelf, maxDepth, autoRefind=autoRefind):
-        traverseCount += 1
-        if compare(child, depth):
-            foundCount += 1
-            if foundCount == foundIndex:
-                child.traverseCount = traverseCount
-                return child
+
+def patched_GetFirstChildControl(self) -> 'Control':
+    """
+    Return `Control` subclass or None.
+    """
+    ele = _AutomationClient.instance().ViewWalker.GetFirstChildElement(self.Element)
+    control = Control.CreateControlFromElement(ele)
+
+    if self.searchByWalk:
+        self.searchByWalk = False
+    elif control:
+        control.isFirstChildFrom = self
+    return control
 
 
-def LogControl(control: Control, depth: int = 0, showAllName: bool = True, showPid: bool = False) -> None:
+def patched_GetNextSiblingControl(self) -> 'Control':
+    """
+    Return `Control` subclass or None.
+    """
+    ele = _AutomationClient.instance().ViewWalker.GetNextSiblingElement(self.Element)
+    control = Control.CreateControlFromElement(ele)
+
+    if self.searchByWalk:
+        self.searchByWalk = False
+    elif control:
+        control.isNextSiblingFrom = self
+    return control
+
+
+def patched_Exists(self, maxSearchSeconds: float = 5, searchIntervalSeconds: float = SEARCH_INTERVAL, printIfNotExist: bool = False) -> bool:
+    """
+    maxSearchSeconds: float
+    searchIntervalSeconds: float
+    Find control every searchIntervalSeconds seconds in maxSearchSeconds seconds.
+    Return bool, True if find
+    """
+    if self.isFirstChildFrom:
+        self.isFirstChildFrom.searchByWalk = True
+        control = self.isFirstChildFrom.GetFirstChildControl()
+        self._element = control.Element
+        control._element = 0
+        return True
+
+    if self.isNextSiblingFrom:
+        self.isNextSiblingFrom.searchByWalk = True
+        control = self.isNextSiblingFrom.GetNextSiblingControl()
+        self._element = control.Element
+        control._element = 0
+        return True
+
+    if self.isPidControl:
+        try:
+            return self.Pids != []
+        except ApplicationError:
+            return False
+
+    if self._element and self._elementDirectAssign:
+        # if element is directly assigned, not by searching, just check whether self._element is valid
+        # but I can't find an API in UIAutomation that can directly check
+        rootElement = GetRootControl().Element
+        if self._element == rootElement:
+            return True
+        else:
+            parentElement = _AutomationClient.instance().ViewWalker.GetParentElement(self._element)
+            if parentElement:
+                return True
+            else:
+                return False
+    # find the element
+    if len(self.searchProperties) == 0:
+        raise LookupError("control's searchProperties must not be empty!")
+    self._element = None
+    startTime = ProcessTime()
+    # Use same timeout(s) parameters for resolve all parents
+    prev = self.searchFromControl
+    if prev and (not prev.isPidControl) and not prev.Exists(maxSearchSeconds, searchIntervalSeconds):
+        if printIfNotExist or DEBUG_EXIST_DISAPPEAR:
+            Logger.ColorfullyLog(self.GetColorfulSearchPropertiesStr() + '<Color=Red> does not exist.</Color>')
+        return False
+    startTime2 = ProcessTime()
+    if DEBUG_SEARCH_TIME:
+        startDateTime = datetime.datetime.now()
+    while True:
+        control = FindControl(self.searchFromControl, self._CompareFunction, self.searchDepth, False, self.foundIndex)
+        if control:
+            self._element = control.Element
+            control._element = 0  # control will be destroyed, but the element needs to be stroed in self._element
+            if DEBUG_SEARCH_TIME:
+                Logger.ColorfullyLog('{} TraverseControls: <Color=Cyan>{}</Color>, SearchTime: <Color=Cyan>{:.3f}</Color>s[{} - {}]'.format(
+                    self.GetColorfulSearchPropertiesStr(), control.traverseCount, ProcessTime() - startTime2,
+                    startDateTime.time(), datetime.datetime.now().time()))
+            if DEBUG_MODE:
+                self.Draw()
+            return True
+        else:
+            remain = startTime + maxSearchSeconds - ProcessTime()
+            if remain > 0:
+                time.sleep(min(remain, searchIntervalSeconds))
+            else:
+                if printIfNotExist or DEBUG_EXIST_DISAPPEAR:
+                    Logger.ColorfullyLog(self.GetColorfulSearchPropertiesStr() + '<Color=Red> does not exist.</Color>')
+                return False
+
+
+def patched_GetPattern(self, patternId: int):
+    """
+    Call IUIAutomationElement::GetCurrentPattern.
+    Get a new pattern by pattern id if it supports the pattern.
+    patternId: int, a value in class `PatternId`.
+    Refer https://docs.microsoft.com/en-us/windows/desktop/api/uiautomationclient/nf-uiautomationclient-iuiautomationelement-getcurrentpattern
+    """
+
+    pattern = self.Element.GetCurrentPattern(patternId)
+    if pattern:
+        subPattern = CreatePattern(patternId, pattern)
+        self._supportedPatterns[patternId] = subPattern
+        return subPattern
+    else:
+        raise PatternError(f"{self.GetSearchPropertiesStr()} does not support {PatternIdNames[patternId]}")
+
+
+def patched_LogControl(control: Control, depth: int = 0, showAllName: bool = True, showPid: bool = False) -> None:
     """
     Print and log control's properties.
     control: `Control` or its subclass.
@@ -113,9 +367,8 @@ def LogControl(control: Control, depth: int = 0, showAllName: bool = True, showP
     supportedPatterns = []
     for id_, name in PatternIdNames.items():
         try:
-            supportedPatterns.append((
-                control.GetPattern(id_, autoRefind=False), name))
-        except RuntimeError:
+            supportedPatterns.append((control.GetPattern(id_), name))
+        except PatternError:
             pass
 
     for pt, name in supportedPatterns:
@@ -139,7 +392,8 @@ def LogControl(control: Control, depth: int = 0, showAllName: bool = True, showP
                 ExpandCollapseState.__dict__, pt.ExpandCollapseState), ConsoleColor.DarkGreen)
         elif isinstance(pt, ScrollPattern):
             Logger.Write('    ScrollPattern.HorizontalScrollPercent: ')
-            Logger.Write(pt.HorizontalScrollPercent, ConsoleColor.DarkGreen)
+            Logger.Write(pt.HorizontalScrollPercent,
+                         ConsoleColor.DarkGreen)
             Logger.Write('    ScrollPattern.VerticalScrollPercent: ')
             Logger.Write(pt.VerticalScrollPercent, ConsoleColor.DarkGreen)
         elif isinstance(pt, GridPattern):
@@ -159,281 +413,274 @@ def LogControl(control: Control, depth: int = 0, showAllName: bool = True, showP
                 Logger.Write('    TextPattern.Text: ')
                 Logger.Write(pt.DocumentRange.GetText(
                     30), ConsoleColor.DarkGreen)
-            except comtypes.COMError as ex:
+            except comtypes.COMError:
                 pass
-    Logger.Write('    SupportedPattern:')
+    Logger.Write('\nSupportedPattern:\n')
     for pt, name in supportedPatterns:
-        Logger.Write(' ' + name, ConsoleColor.DarkGreen)
+        Logger.Write(' ' + f"Get{name}" + '\n', ConsoleColor.DarkGreen)
+        method_list = [func for func in dir(pt) if callable(getattr(pt, func)) and not func.startswith("__")]
+        for method in method_list:
+            Logger.Write('     ' + method + '\n', ConsoleColor.DarkGreen)
     Logger.Write('\n')
 
 
-def GetRootControl() -> PaneControl:
-    """
-    Get root control, the Desktop window.
-    Return `PaneControl`.
-    """
-    control = Control.CreateControlFromElement(
-        _AutomationClient.instance().IUIAutomation.GetRootElement())
-    control.isRootControl = True
-    return control
-
-
-def EnumAndLogControl(control: Control, maxDepth: int = 0xFFFFFFFF, showAllName: bool = True, showPid: bool = False, startDepth: int = 0) -> None:
-    """
-    Print and log control and its descendants' propertyies.
-    control: `Control` or its subclass.
-    maxDepth: int, enum depth.
-    showAllName: bool, if False, print the first 30 characters of control.Name.
-    startDepth: int, control's current depth.
-    """
-    for c, d in WalkControl(control, True, maxDepth):
-        LogControl(c, d + startDepth, showAllName, showPid)
-
-
-class patched_function(object):
-    def GetSearchPropertiesStr(self) -> str:
-        strs = []
-        for k, v in self.searchProperties.items():
-            if k == 'ControlType':
-                strs.append('{}: {}'.format(k, ControlTypeNames[v]))
-            elif k == 'Child':
-                strs.append('{}: {}'.format(k, v.GetSearchPropertiesStr()))
-            else:
-                strs.append(repr(v))
-
-        return '{' + ', '.join(strs) + '}'
-
-    def Refind(self, maxSearchSeconds: float = TIME_OUT_SECOND, searchIntervalSeconds: float = SEARCH_INTERVAL, raiseException: bool = True) -> bool:
-        """
-        Refind the control every searchIntervalSeconds seconds in maxSearchSeconds seconds.
-        maxSearchSeconds: float.
-        searchIntervalSeconds: float.
-        raiseException: bool, if True, raise a LookupError if timeout.
-        Return bool, True if find.
-        """
-        if self.isRootControl:
-            # self = GetRootControl()
-            return True
-        if not self.Exists(maxSearchSeconds, searchIntervalSeconds, False if raiseException else DEBUG_EXIST_DISAPPEAR):
-            if raiseException:
-                Logger.ColorfullyLog(
-                    '<Color=Red>Find Control Timeout: </Color>' + self.GetColorfulSearchPropertiesStr())
-                raise LookupError('Find Control Timeout: ' +
-                                  self.GetSearchPropertiesStr())
-            else:
-                return False
-        return True
-
-    def GetFirstChildControl(self, autoRefind=True) -> 'Control':
-        """
-        Return `Control` subclass or None.
-        """
-        if autoRefind:
-            _ele = self.Element
+def patched_GetSearchPropertiesStr(self) -> str:
+    strs = []
+    for k, v in self.searchProperties.items():
+        if k == 'ControlType':
+            strs.append('{}: {}'.format(k, ControlTypeNames[v]))
+        elif k == 'Child':
+            strs.append('{}: {}'.format(k, v.GetSearchPropertiesStr()))
         else:
-            _ele = self._element
-        ele = _AutomationClient.instance().ViewWalker.GetFirstChildElement(_ele)
-        control = Control.CreateControlFromElement(ele)
+            strs.append(repr(v))
 
-        if self.searchByWalk:
-            self.searchByWalk = False
-        elif control:
-            control.isFirstChildFrom = self
-        return control
+    return '{' + ', '.join(strs) + '}'
 
-    def GetNextSiblingControl(self, autoRefind=True) -> 'Control':
-        """
-        Return `Control` subclass or None.
-        """
-        if autoRefind:
-            _ele = self.Element
-        else:
-            _ele = self._element
-        ele = _AutomationClient.instance().ViewWalker.GetNextSiblingElement(_ele)
-        control = Control.CreateControlFromElement(ele)
 
-        if self.searchByWalk:
-            self.searchByWalk = False
-        elif control:
-            control.isNextSiblingFrom = self
-        return control
+def patch_Draw(self):
+    rect = self.Element.CurrentBoundingRectangle
+    draw_rectangle(rect.left, rect.top, rect.right, rect.bottom)
 
-    def Exists(self, maxSearchSeconds: float = 5, searchIntervalSeconds: float = SEARCH_INTERVAL, printIfNotExist: bool = False, autoRefind=True) -> bool:
-        """
-        maxSearchSeconds: float
-        searchIntervalSeconds: float
-        Find control every searchIntervalSeconds seconds in maxSearchSeconds seconds.
-        Return bool, True if find
-        """
-        if self.isFirstChildFrom:
-            self.isFirstChildFrom.Refind()
-            self.isFirstChildFrom.searchByWalk = True
-            control = self.isFirstChildFrom.GetFirstChildControl()
-            self._element = control.Element
-            control._element = 0
-            return True
 
-        if self.isNextSiblingFrom:
-            self.isNextSiblingFrom.Refind()
-            self.isNextSiblingFrom.searchByWalk = True
-            control = self.isNextSiblingFrom.GetNextSiblingControl()
-            self._element = control.Element
-            control._element = 0
-            return True
+def patched_GetChildrenByName(self, Name) -> 'Control':
+    child_list = self.GetChildren()
+    child = [x for x in child_list if Name == x.Name]
+    if len(child) == 0:
+        raise UiLookupError(f"Can not find a child control named {Name}")
+    if len(child) > 1:
+        raise UiLookupError(f"Find multiple children control named {Name}")
+    return child[0]
 
-        if self._element and self._elementDirectAssign:
-            # if element is directly assigned, not by searching, just check whether self._element is valid
-            # but I can't find an API in UIAutomation that can directly check
-            rootElement = GetRootControl().Element
-            if self._element == rootElement:
-                return True
-            else:
-                parentElement = _AutomationClient.instance(
-                ).ViewWalker.GetParentElement(self._element)
-                if parentElement:
-                    return True
+
+def patched_SelectByPath(self, path):
+    """
+    path = "root_name -> layer1_name -> layer2_name"
+    """
+    if "->" in path:
+        path_list = path.split("->")
+    else:
+        path_list = path.split(">")
+    path_list = [x.strip() for x in path_list]
+    temp = self
+    for item in path_list:
+        logging.debug(f"To find Child '{item}'")
+        temp = temp.GetChildrenByName(Name=item)
+        if not temp.Exists():
+            raise UiLookupError(f"Can not find tree item '{item}'") from None
+
+        logging.debug(f"Select tree item '{temp.Name}'")
+        if item is path_list[-1]:
+            temp.GetSelectionItemPattern().Select()
+            return temp
+        logging.debug(f"To expand '{temp.Name}'")
+        temp.GetExpandCollapsePattern().Expand()
+
+
+def patched_Walk(self, Name="") -> list:
+    def _control_walk(control, layer=1, Name=""):
+        childs = control.GetChildren()
+        childs_list = []
+        for child in childs:
+            child_dict = {}
+            child_dict["Name"] = child.Name
+            child_dict["Type"] = child.ControlTypeName
+            if (Name and Name == child.Name) or not Name:
+                print(
+                    " " * layer * 8 + f'{child_dict["Name"]} ({child_dict["Type"]}, depth={layer})')
+            child_dict["Child"] = _control_walk(child, layer + 1, Name=Name)
+            childs_list.append(child_dict)
+        return childs_list
+    return _control_walk(self, Name=Name)
+
+
+def patched_Walk(self, Name="") -> list:
+    def _control_walk(control, layer=1, Name=""):
+        childs = control.GetChildren()
+        childs_list = []
+        for child in childs:
+            child_dict = {}
+            child_dict["Name"] = child.Name
+            child_dict["Type"] = child.ControlTypeName
+            if (Name and Name == child.Name) or not Name:
+                print(
+                    " " * layer * 8 + f'{child_dict["Name"]} ({child_dict["Type"]}, depth={layer})')
+            child_dict["Child"] = _control_walk(child, layer + 1, Name=Name)
+            childs_list.append(child_dict)
+        return childs_list
+    return _control_walk(self, Name=Name)
+
+
+def patched_GetValue(self):
+    result = []
+    children = self.GetChildren()
+    for child in children:
+        result.append([x.Name for x in child.GetChildren()])
+
+    titles = result.pop(0)
+    result = [x for x in result if len(x) == len(titles)]
+    pair_mode = False
+    for i in range(len(result) - 1):
+        if result[i][0] == result[i + 1][0]:
+            pair_mode = True
+            break
+
+    if len(titles) > 2:
+        all = []
+        for item in result:
+            temp_dict = collections.OrderedDict()
+            for i in range(len(titles)):
+                temp_dict[titles[i]] = item[i]
+            all.append(temp_dict)
+        result = all
+
+    else:
+        all = []
+        temp_dict = collections.OrderedDict()
+        for item in result:
+
+            if item != ['', '']:
+                if item[0] in temp_dict:
+                    if isinstance(temp_dict[item[0]], str):
+                        temp_dict[item[0]] = [temp_dict[item[0]], item[1]]
+                    else:
+                        temp_dict[item[0]].append(item[1])
                 else:
-                    return False
-        # find the element
-        if len(self.searchProperties) == 0:
-            raise LookupError("control's searchProperties must not be empty!")
-        self._element = None
-        startTime = ProcessTime()
-        # Use same timeout(s) parameters for resolve all parents
+                    temp_dict[item[0]] = item[1]
 
-        prev = self.searchFromControl
+            if item == ['', ''] or item is result[-1]:
+                all.append(temp_dict)
+                temp_dict = collections.OrderedDict()
+        result = all
 
-        if autoRefind and prev and not prev._element and not prev.Exists(maxSearchSeconds, searchIntervalSeconds):
-            if printIfNotExist or DEBUG_EXIST_DISAPPEAR:
-                Logger.ColorfullyLog(self.GetColorfulSearchPropertiesStr(
-                ) + '<Color=Red> does not exist.</Color>')
-            return False
-        startTime2 = ProcessTime()
-        if DEBUG_SEARCH_TIME:
-            startDateTime = datetime.datetime.now()
-        while True:
-            control = FindControl(
-                self.searchFromControl, self._CompareFunction, self.searchDepth, False, self.foundIndex, autoRefind=autoRefind)
-            if control:
-                self._element = control.Element
-                # control will be destroyed, but the element needs to be stroed in self._element
-                control._element = 0
-                if DEBUG_SEARCH_TIME:
-                    Logger.ColorfullyLog('{} TraverseControls: <Color=Cyan>{}</Color>, SearchTime: <Color=Cyan>{:.3f}</Color>s[{} - {}]'.format(
-                        self.GetColorfulSearchPropertiesStr(), control.traverseCount, ProcessTime() -
-                        startTime2,
-                        startDateTime.time(), datetime.datetime.now().time()))
-                return True
+    return result
+
+
+def patched_ToggleTo(self, status, waitTime: float = OPERATION_WAIT_TIME) -> bool:
+    """
+    Toggle to the status
+    status = on, check, checked, yes, y, true, 1
+                off,  uncheck , unchecked, no, n, false, 0
+                indeterminate, 2
+    """
+    for _ in range(10):
+        if toggle_state(self.pattern.CurrentToggleState) == toggle_state(status):
+            return True
+        self.Toggle()
+        time.sleep(waitTime)
+    else:
+        raise UiLookupError(f"Fail to toggle checkbox to {status}")
+
+
+def patched_StateShouldBe(self, expected_state):
+    actual_state = toggle_state(self.pattern.CurrentToggleState)
+    expected_state = toggle_state(expected_state)
+    if actual_state != expected_state:
+        raise UiLookupError(f"The expected checkbox state is '{expected_state}', however the actual state is '{actual_state}'")
+
+
+def patched_Write(log: Any, consoleColor: int = ConsoleColor.Default, writeToFile: bool = True, printToStdout: bool = True, logFile: str = None, printTruncateLen: int = 0) -> None:
+    """
+    log: any type.
+    consoleColor: int, a value in class `ConsoleColor`, such as `ConsoleColor.DarkGreen`.
+    writeToFile: bool.
+    printToStdout: bool.
+    logFile: str, log file path.
+    printTruncateLen: int, if <= 0, log is not truncated when print.
+    """
+    if not isinstance(log, str):
+        log = str(log)
+    if printToStdout and sys.stdout:
+        isValidColor = (consoleColor >= ConsoleColor.Black and consoleColor <= ConsoleColor.White)
+        if isValidColor:
+            SetConsoleColor(consoleColor)
+        try:
+            if printTruncateLen > 0 and len(log) > printTruncateLen:
+                sys.stdout.write(log[:printTruncateLen] + '...')
             else:
-                remain = startTime + maxSearchSeconds - ProcessTime()
-                if remain > 0:
-                    time.sleep(min(remain, searchIntervalSeconds))
-                else:
-                    if printIfNotExist or DEBUG_EXIST_DISAPPEAR:
-                        Logger.ColorfullyLog(self.GetColorfulSearchPropertiesStr(
-                        ) + '<Color=Red> does not exist.</Color>')
-                    return False
-
-    def _CompareFunction(self, control: 'Control', depth: int) -> bool:
-        """
-        Define how to search.
-        control: `Control` or its subclass.
-        depth: int, tree depth from searchFromControl.
-        Return bool.
-        """
-        for key, value in self.searchProperties.items():
-            if 'ControlType' == key:
-                if value != control.ControlType:
-                    return False
-            elif 'ClassName' == key:
-                if value != control.ClassName:
-                    return False
-            elif 'AutomationId' == key:
-                if value != control.AutomationId:
-                    return False
-            elif 'Depth' == key:
-                if value != depth:
-                    return False
-            elif 'Name' == key:
-                if value != control.Name:
-                    return False
-            elif 'SubName' == key:
-                if value not in control.Name:
-                    return False
-            elif 'RegexName' == key:
-                if not self.regexName.match(control.Name):
-                    return False
-            elif 'Compare' == key:
-                if not value(control, depth):
-                    return False
-            elif 'Child' == key:
-                value.searchFromControl = control
-                if not value.Exists(autoRefind=False):
-                    return False
-            # elif 'ChildProperty' == key:
-            #     value.SetSearchFromControl(self)
-            #     if not value.Exists():
-            #         return False
-        return True
-
-    def GetPattern(self, patternId: int, autoRefind=True):
-        """
-        Call IUIAutomationElement::GetCurrentPattern.
-        Get a new pattern by pattern id if it supports the pattern.
-        patternId: int, a value in class `PatternId`.
-        Refer https://docs.microsoft.com/en-us/windows/desktop/api/uiautomationclient/nf-uiautomationclient-iuiautomationelement-getcurrentpattern
-        """
-        if autoRefind:
-            self.Refind()
-
-        pattern = self.Element.GetCurrentPattern(patternId)
-        if pattern:
-            subPattern = CreatePattern(patternId, pattern)
-            self._supportedPatterns[patternId] = subPattern
-            return subPattern
-        else:
-            raise RuntimeError(
-                f"The control didn't support {PatternIdNames[patternId]}")
-
-    def Element(self):
-        """
-        Property Element.
-        Return `ctypes.POINTER(IUIAutomationElement)`.
-        """
-        _error = None
-        for _ in range(6):
-            try:
-                if not self._element:
-                    self.Refind(maxSearchSeconds=TIME_OUT_SECOND,
-                                searchIntervalSeconds=self.searchInterval)
-                return self._element
-            except comtypes.COMError as ex:
-                _error = ex
-                self.Refind()
-                time.sleep(20)
-        else:
-            raise _error
+                sys.stdout.write(log)
+        except Exception as ex:
+            SetConsoleColor(ConsoleColor.Red)
+            isValidColor = True
+            sys.stdout.write(ex.__class__.__name__ + ': can\'t print the log!')
+            if log.endswith('\n'):
+                sys.stdout.write('\n')
+        if isValidColor:
+            ResetConsoleColor()
+        sys.stdout.flush()
+    if not writeToFile:
+        return
+    fileName = logFile if logFile else Logger.FileName
+    folder = Path(fileName).parent
+    if not folder.is_dir():
+        folder.mkdir(parents=True)
+    fout = None
+    try:
+        fout = open(fileName, 'a+', encoding='utf-8')
+        fout.write(log)
+    except Exception as ex:
+        if sys.stdout:
+            sys.stdout.write(ex.__class__.__name__ + ': can\'t write the log!')
+    finally:
+        if fout:
+            fout.close()
 
 
-# new property for auto refinding
-Control.searchByWalk = False
-Control.isFirstChildFrom = None
-Control.isNextSiblingFrom = None
-Control.isRootControl = False
+uiautomation.LogControl = controls_support(patched_LogControl)
+uiautomation.WalkControl = patched_WalkControl
 
-# decorate functions, auto refind control when function execution
-Control.SetFocus = autoRefind(Control.SetFocus)
-Control.GetPattern = autoRefind(Control.GetPattern)
-Control.__str__ = autoRefind(Control.__str__)
+uiautomation.Control.Element = property(patched_Element)
+uiautomation.Control.isPidControl = False
+uiautomation.Control.searchByWalk = None
+uiautomation.Control.isFirstChildFrom = None
+uiautomation.Control.isNextSiblingFrom = None
+uiautomation.Control.Refind = patched_Refind
+uiautomation.Control.GetFirstChildControl = patched_GetFirstChildControl
+uiautomation.Control.GetNextSiblingControl = patched_GetNextSiblingControl
+uiautomation.Control.GetPattern = patched_GetPattern
+uiautomation.Control.Log = controls_support(patched_LogControl)
+uiautomation.Control.Walk = controls_support(patched_Walk)
+uiautomation.Control.Exists = patched_Exists
+uiautomation.Control._CompareFunction = patched_CompareFunction
+uiautomation.Control.GetSearchPropertiesStr = patched_GetSearchPropertiesStr
+uiautomation.Control.Draw = patch_Draw
+uiautomation.Control.Screenshot = Screenshot
+uiautomation.Control.GetChildrenByName = patched_GetChildrenByName
 
-# patch functions
-Control.GetSearchPropertiesStr = patched_function.GetSearchPropertiesStr
-Control.Element = property(patched_function.Element)
-Control.GetPattern = patched_function.GetPattern
-Control.GetFirstChildControl = patched_function.GetFirstChildControl
-Control.GetNextSiblingControl = patched_function.GetNextSiblingControl
-Control.Exists = patched_function.Exists
-Control._CompareFunction = patched_function._CompareFunction
-Control.Refind = patched_function.Refind
-Control.Log = LogControl
-Control.Walk = EnumAndLogControl
+uiautomation.TreeControl.SelectByPath = patched_SelectByPath
+uiautomation.DataItemControl.GetInvokePattern = uiautomation.ButtonControl.GetInvokePattern
+uiautomation.ListControl.GetValue = patched_GetValue
+uiautomation.CheckBoxControl.GetSelectionItemPattern = uiautomation.TreeItemControl.GetSelectionItemPattern
+uiautomation.CheckBoxControl.GetExpandCollapsePattern = uiautomation.TreeItemControl.GetExpandCollapsePattern
+uiautomation.TogglePattern.ToggleTo = patched_ToggleTo
+uiautomation.TogglePattern.StateShouldBe = patched_StateShouldBe
+uiautomation.Logger.Write = staticmethod(patched_Write)
+
+
+def window_should_exists(**kwarg):
+    """
+    Arg1:
+        Name or SubName or RegexName
+
+    Arg2:
+        timeout, default is TIME_OUT_SECOND
+    """
+    name = kwarg.get("Name", None) or kwarg.get("SubName", None) or kwarg.get("RegexName", None)
+    window = WindowControl(**kwarg)
+    if not window.Exists(kwarg.get("timeout", TIME_OUT_SECOND)):
+        raise UiLookupError(f"'{name}' window does not exist",
+                            filename="WindowNotFound.jpg")
+
+
+def window_should_not_exists(**kwarg):
+    """
+    Arg1:
+        Name or SubName or RegexName
+
+    Arg2:
+        timeout, default is TIME_OUT_SECOND
+    """
+    name = kwarg.get("Name", None) or kwarg.get("SubName", None) or kwarg.get("RegexName", None)
+    window = WindowControl(**kwarg)
+    if window.Exists(kwarg.get("timeout", TIME_OUT_SECOND)):
+        raise UiLookupError(f"Unexpected '{name}' found, the window should not exist",
+                            filename="UnexpetedWindow.jpg")

@@ -1,9 +1,8 @@
 from setuptools import find_packages, setup
-from uiauto import VERSION
 
 setup(
     name="uiauto-patch",
-    version=VERSION,
+    version="0.0.1",
     description='Enhanced uiautomation module',
     license='Apache 2.0',
     author='ForisCai',
@@ -21,5 +20,9 @@ setup(
         "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
     ],
-    install_requires=["uiautomation==2.0.10"],
+    install_requires=[
+        "uiautomation==2.0.11",
+        "psutil",
+        "pywin32",
+    ],
 )
