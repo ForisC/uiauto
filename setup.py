@@ -1,8 +1,8 @@
 from setuptools import find_packages, setup
 
 setup(
-    name="uiauto-patch",
-    version="0.0.1",
+    name="uiauto",
+    version="0.0.2",
     description='Enhanced uiautomation module',
     license='Apache 2.0',
     author='ForisCai',

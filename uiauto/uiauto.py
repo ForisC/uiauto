@@ -1,7 +1,7 @@
 import collections
-from ctypes import DEFAULT_MODE
 import logging
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -216,8 +216,11 @@ def patched_GetFirstChildControl(self) -> 'Control':
     """
     Return `Control` subclass or None.
     """
-    ele = _AutomationClient.instance().ViewWalker.GetFirstChildElement(self.Element)
-    control = Control.CreateControlFromElement(ele)
+    try:
+        ele = _AutomationClient.instance().ViewWalker.GetFirstChildElement(self.Element)
+        control = Control.CreateControlFromElement(ele)
+    except comtypes.COMError:
+        control = None
 
     if self.searchByWalk:
         self.searchByWalk = False
@@ -230,8 +233,11 @@ def patched_GetNextSiblingControl(self) -> 'Control':
     """
     Return `Control` subclass or None.
     """
-    ele = _AutomationClient.instance().ViewWalker.GetNextSiblingElement(self.Element)
-    control = Control.CreateControlFromElement(ele)
+    try:
+        ele = _AutomationClient.instance().ViewWalker.GetNextSiblingElement(self.Element)
+        control = Control.CreateControlFromElement(ele)
+    except comtypes.COMError:
+        control = None
 
     if self.searchByWalk:
         self.searchByWalk = False
